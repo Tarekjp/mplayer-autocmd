@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+# Copyright (C) 2013, 2015 Wieland Hoffmann
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+import yaml
+import logging
+import re
+import sys
+import subprocess
+
+from os import fdopen, getenv, remove
+from os.path import expanduser, join
+from tempfile import mkstemp
+
+
+def build_keycmd_file(keycmds):
+    if not keycmds:
+        return None
+    (fd, filename) = mkstemp("mplayerconf")
+    _file = fdopen(fd, "wt")
+    for key, command in keycmds.items():
+        logging.debug("%s: %s" % (key, command))
+        if key not in ("regex", "options"):
+            _file.write("%s %s\n" % (key, command))
+    _file.close()
+    return filename
+
+
+def read_config():
+    configfile = join(getenv("XDG_CONFIG_HOME", expanduser("~/.config")),
+                      "mplayer-autocmd", "config.yml")
+    with open(configfile, "r") as config:
+        return yaml.load(config)
+
+
+def setup_logging():
+    if "-d" in sys.argv:
+        logging.basicConfig(level=logging.DEBUG,
+                            format="%(levelname)s: %(funcName)s: %(message)s")
+        sys.argv.remove("-d")
+    else:
+        logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+
+class Player(object):
+    def __init__(self, options):
+        self.options = options
+        self.files_to_remove = []
+
+    def find_config_section_for_filename(self, filename):
+        for key, section in self.options.items():
+            # Sanity check
+            if "regex" not in section.keys():
+                raise ValueError("Section %s does not contain a 'regex' key" %
+                                 key)
+            if (re.search(section["regex"], filename, re.IGNORECASE) is not
+                None):  # noqa
+                logging.info("Using profile '%s'" % key)
+                return section
+        return None
+
+    def __enter__(self):
+        return self
+
+    def play(self, filename):
+        args = ["mpv"]
+        args.append(filename)
+
+        file_options = self.find_config_section_for_filename(filename)
+
+        if file_options is None:
+            logging.info("No profile found")
+        else:
+            keycmd_file = None
+            args.extend(file_options.get("options", []))
+            keycmd_file = build_keycmd_file(file_options.get("keys", {}))
+            if keycmd_file is not None:
+                args.extend(["--input-conf", keycmd_file])
+                self.files_to_remove.append(keycmd_file)
+
+        logging.info("Calling %s", args)
+        ret = subprocess.call(args)
+
+        if not ret and file_options is not None:
+            if file_options.get("remove_after_playing", False):
+                self.files_to_remove.append(filename)
+
+            caa_setting = file_options["call_after_playing"]
+            if caa_setting is not None:
+                logging.info("Calling %s", caa_setting)
+                subprocess.call(caa_setting)
+
+    def __exit__(self, type, value, traceback):
+        for filename in self.files_to_remove:
+            logging.info("Removing %s", filename)
+            remove(filename)
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.exit(1)
+
+    setup_logging()
+    options = read_config()
+
+    with Player(options) as p:
+        for filename in sys.argv[1:]:
+            p.play(filename)
+
+
+if __name__ == '__main__':
+    main()
